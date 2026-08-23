@@ -44,6 +44,7 @@
 
   CONTROLS:
     SPACE / Left Mouse Click  -> Drop the current floor
+    P                         -> Pause / resume
     R                         -> Restart the game
     ESC                       -> Quit
  =====================================================================
@@ -104,6 +105,7 @@ float moveSpeed  = 0.08f;
 const float moveSpeedBase = 0.08f;
 
 GameState state = PLAYING;
+bool  paused = false;   // freezes movement/physics/timers; toggled with P
 int   score = 0;
 int   bestScore = 0;
 
@@ -742,6 +744,7 @@ void resetGame() {
     score = 0;
     moveSpeed = moveSpeedBase;
     state = PLAYING;
+    paused = false;
     perfectPopupActive = false;
     perfectPopupTimer  = 0.0f;
     lastPerfectPoints  = 0;
@@ -825,7 +828,7 @@ void collapseTower() {
 }
 
 void dropBlock() {
-    if (state != PLAYING) return;
+    if (state != PLAYING || paused) return;
 
     const Block &top = tower.back();
     bool alongX = (moveAxis == 0);
@@ -916,6 +919,15 @@ void update(int value) {
     float dt = (lastUpdateTimeMs == 0) ? 0.016f : (nowMs - lastUpdateTimeMs) / 1000.0f;
     if (dt > 0.1f) dt = 0.1f; // clamp so a big stall doesn't cause a huge jump
     lastUpdateTimeMs = nowMs;
+
+    if (paused) {
+        // Everything -- movement, wobble, falling debris, popups, camera --
+        // stays frozen while paused; lastUpdateTimeMs still advances above
+        // so resuming doesn't produce a giant dt jump.
+        glutPostRedisplay();
+        glutTimerFunc(16, update, 0);
+        return;
+    }
 
     if (state == PLAYING) {
         if (moveAxis == 0) {
@@ -1137,7 +1149,7 @@ void display() {
     glColor3f(0.85f, 0.85f, 0.85f);
     drawText(barX, barY + barH + 4, "Stability", GLUT_BITMAP_HELVETICA_12);
 
-    drawText(20, 20, "SPACE/Click=Drop | R=Restart | ESC=Quit",
+    drawText(20, 20, "SPACE/Click=Drop | P=Pause | R=Restart | ESC=Quit",
               GLUT_BITMAP_HELVETICA_12);
 
     // ---- "Perfect!" bonus popup: pops up, floats, then fades out ----
@@ -1282,6 +1294,26 @@ void display() {
                   GLUT_BITMAP_HELVETICA_18);
     }
 
+    // ---- "PAUSED" overlay: shown while paused, gameplay frozen underneath ----
+    if (state == PLAYING && paused) {
+        glColor4f(0.0f, 0.0f, 0.0f, 0.45f);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glBegin(GL_QUADS);
+            glVertex2f(windowWidth/2.0f - 150, windowHeight/2.0f - 45);
+            glVertex2f(windowWidth/2.0f + 150, windowHeight/2.0f - 45);
+            glVertex2f(windowWidth/2.0f + 150, windowHeight/2.0f + 45);
+            glVertex2f(windowWidth/2.0f - 150, windowHeight/2.0f + 45);
+        glEnd();
+        glDisable(GL_BLEND);
+
+        glColor3f(1.0f, 1.0f, 1.0f);
+        drawText(windowWidth/2.0f - 55, windowHeight/2.0f + 12, "PAUSED",
+                  GLUT_BITMAP_TIMES_ROMAN_24);
+        drawText(windowWidth/2.0f - 100, windowHeight/2.0f - 20, "Press P to resume",
+                  GLUT_BITMAP_HELVETICA_18);
+    }
+
     glEnable(GL_DEPTH_TEST);
     glEnable(GL_LIGHTING);
 
@@ -1300,6 +1332,10 @@ void keyboard(unsigned char key, int x, int y) {
     switch (key) {
         case ' ':
             dropBlock();
+            break;
+        case 'p':
+        case 'P':
+            if (state == PLAYING) paused = !paused;
             break;
         case 'r':
         case 'R':
