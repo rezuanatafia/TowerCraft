@@ -1,6 +1,6 @@
 /*
  =====================================================================
-  TOWERCRAFT  —  A Tower-Stacking Game built with GLUT / OpenGL
+  TOWERCRAFT  ï¿½  A Tower-Stacking Game built with GLUT / OpenGL
  =====================================================================
   Features:
     - Moving cube block (alternates X / Z axis each floor)
@@ -148,6 +148,18 @@ const float WOBBLE_DAMPING       = 2.4f;
 const float WOBBLE_DEG_SCALE     = 78.0f; // radians -> degrees for rendering
 
 int lastUpdateTimeMs = 0; // used to compute real elapsed time between frames
+
+// --- Plane crash easter egg: purely cosmetic, fires once at score 911 and
+//     never touches score/tower/state -- the game continues normally. ---
+enum PlaneState { PLANE_NONE, PLANE_FLYING, PLANE_CRASHED };
+PlaneState  planeState            = PLANE_NONE;
+bool        planeEventTriggered   = false;
+float       planeX = 0.0f, planeY = 0.0f, planeZ = 0.0f;
+const float PLANE_SPEED           = 14.0f; // world units / second
+const int   PLANE_TRIGGER_SCORE   = 911;
+bool        planeCrashPopupActive = false;
+float       planeCrashPopupTimer  = 0.0f;
+const float PLANE_CRASH_POPUP_DURATION = 2.2f;
 
 // ---------------------------------------------------------------
 //  CURATED PALETTE  (Color Hunt: ffbe91 / ffddb0 / fffce1 / cfebff,
@@ -453,23 +465,247 @@ void drawText(float x, float y, const char* text, void* font = GLUT_BITMAP_HELVE
         glutBitmapCharacter(font, *c);
 }
 
+// Cheap deterministic pseudo-random in [0,1) -- used so ground decoration
+// stays fixed frame-to-frame instead of jittering with rand().
+float hashRand(int i, int salt) {
+    float x = sinf((float)i * 12.9898f + (float)salt * 78.233f) * 43758.5453f;
+    return x - floorf(x);
+}
+
+void drawGrassTuft(float x, float z, float scale) {
+    float g = 0.42f + hashRand((int)(x*31+z*77), 6) * 0.18f;
+    glColor3f(0.16f + hashRand((int)(x*97+z*13), 5) * 0.06f, g, 0.14f);
+    glBegin(GL_TRIANGLES);
+        glVertex3f(x, 0.0f, z);
+        glVertex3f(x - 0.06f*scale, 0.28f*scale, z);
+        glVertex3f(x + 0.03f*scale, 0.02f, z);
+
+        glVertex3f(x, 0.0f, z);
+        glVertex3f(x + 0.06f*scale, 0.30f*scale, z + 0.02f);
+        glVertex3f(x - 0.03f*scale, 0.02f, z);
+
+        glVertex3f(x, 0.0f, z);
+        glVertex3f(x, 0.34f*scale, z - 0.03f);
+        glVertex3f(x + 0.02f, 0.02f, z + 0.03f);
+    glEnd();
+}
+
+void drawFlower(float x, float z, int colorIdx) {
+    static const float petalColors[4][3] = {
+        {0.95f, 0.85f, 0.25f}, // yellow
+        {0.95f, 0.55f, 0.70f}, // pink
+        {0.97f, 0.97f, 0.97f}, // white
+        {0.68f, 0.58f, 0.92f}, // lavender
+    };
+    const float* c = petalColors[((colorIdx % 4) + 4) % 4];
+    glColor3f(c[0], c[1], c[2]);
+    const float r = 0.09f;
+    for (int i = 0; i < 5; i++) {
+        float t = 2.0f * PI_F * i / 5.0f;
+        float px = x + cosf(t) * r;
+        float pz = z + sinf(t) * r;
+        glBegin(GL_TRIANGLE_FAN);
+            glVertex3f(x, 0.03f, z);
+            glVertex3f(px, 0.03f, pz);
+            glVertex3f(x + cosf(t+0.5f)*r*0.6f, 0.03f, z + sinf(t+0.5f)*r*0.6f);
+        glEnd();
+    }
+    glColor3f(0.85f, 0.65f, 0.15f);
+    glBegin(GL_TRIANGLE_FAN);
+        for (int i = 0; i <= 8; i++) {
+            float t = 2.0f * PI_F * i / 8.0f;
+            glVertex3f(x + cosf(t)*0.03f, 0.035f, z + sinf(t)*0.03f);
+        }
+    glEnd();
+}
+
 void drawGround() {
     glDisable(GL_LIGHTING);
-    glColor3f(0.16f, 0.18f, 0.24f);
-    float size = 60.0f;
+    const float size = 60.0f;
+
+    // soft two-tone grass field
     glBegin(GL_QUADS);
+        glColor3f(0.36f, 0.60f, 0.33f);
         glVertex3f(-size, -0.02f, -size);
         glVertex3f( size, -0.02f, -size);
+        glColor3f(0.46f, 0.71f, 0.41f);
         glVertex3f( size, -0.02f,  size);
         glVertex3f(-size, -0.02f,  size);
     glEnd();
 
-    glColor3f(0.26f, 0.29f, 0.36f);
-    glBegin(GL_LINES);
-    for (float i = -size; i <= size; i += 2.0f) {
-        glVertex3f(i, -0.01f, -size); glVertex3f(i, -0.01f, size);
-        glVertex3f(-size, -0.01f, i); glVertex3f(size, -0.01f, i);
+    // circular stone plaza under the tower's footprint, replacing the old grid
+    const float plazaR   = 9.0f;
+    const int   ringSegs = 48;
+    const int   rings    = 5;
+    for (int ring = 0; ring < rings; ring++) {
+        float rInner = plazaR * ring / rings;
+        float rOuter = plazaR * (ring + 1) / rings;
+        float shade  = 0.56f + 0.05f * (ring % 2);
+        glColor3f(shade, shade * 0.97f, shade * 0.90f);
+        glBegin(GL_TRIANGLE_STRIP);
+        for (int i = 0; i <= ringSegs; i++) {
+            float t = 2.0f * PI_F * i / ringSegs;
+            glVertex3f(cosf(t)*rOuter, -0.015f, sinf(t)*rOuter);
+            glVertex3f(cosf(t)*rInner, -0.015f, sinf(t)*rInner);
+        }
+        glEnd();
     }
+    glColor3f(0.44f, 0.42f, 0.37f); // soft outline, not black
+    glLineWidth(1.2f);
+    glBegin(GL_LINE_LOOP);
+        for (int i = 0; i < ringSegs; i++) {
+            float t = 2.0f * PI_F * i / ringSegs;
+            glVertex3f(cosf(t)*plazaR, -0.01f, sinf(t)*plazaR);
+        }
+    glEnd();
+
+    // grass tufts + flowers scattered outside the plaza (deterministic layout)
+    const int decorCount = 140;
+    for (int i = 0; i < decorCount; i++) {
+        float rx = (hashRand(i, 1) - 0.5f) * 2.0f * size;
+        float rz = (hashRand(i, 2) - 0.5f) * 2.0f * size;
+        float dist = sqrtf(rx*rx + rz*rz);
+        if (dist < plazaR + 1.0f || dist > size * 0.95f) continue;
+        if (hashRand(i, 3) < 0.65f)
+            drawGrassTuft(rx, rz, 0.8f + hashRand(i, 4) * 0.6f);
+        else
+            drawFlower(rx, rz, (int)(hashRand(i, 7) * 4.0f));
+    }
+
+    glEnable(GL_LIGHTING);
+}
+
+// ---------------------------------------------------------------
+//  SKY BACKDROP  (gradient sky, sun, distant hills, drifting clouds)
+//  Drawn as a flat 2D layer before the 3D scene so it always sits behind
+//  everything, replacing the old flat blue clear color.
+// ---------------------------------------------------------------
+void drawCircle2D(float cx, float cy, float r) {
+    const int segs = 24;
+    glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(cx, cy);
+        for (int i = 0; i <= segs; i++) {
+            float t = 2.0f * PI_F * i / segs;
+            glVertex2f(cx + r*cosf(t), cy + r*sinf(t));
+        }
+    glEnd();
+}
+
+void drawCloud2D(float cx, float cy, float scale, float alpha) {
+    glColor4f(0.85f, 0.88f, 0.93f, alpha * 0.8f);
+    drawCircle2D(cx, cy - 0.22f*scale, 0.62f*scale);
+
+    glColor4f(1.0f, 1.0f, 1.0f, alpha);
+    drawCircle2D(cx - 0.6f*scale, cy, 0.52f*scale);
+    drawCircle2D(cx + 0.6f*scale, cy, 0.52f*scale);
+    drawCircle2D(cx, cy + 0.32f*scale, 0.66f*scale);
+    drawCircle2D(cx - 1.25f*scale, cy - 0.08f*scale, 0.38f*scale);
+    drawCircle2D(cx + 1.25f*scale, cy - 0.08f*scale, 0.38f*scale);
+}
+
+void drawSkyBackdrop() {
+    glMatrixMode(GL_PROJECTION);
+    glPushMatrix();
+    glLoadIdentity();
+    gluOrtho2D(0, windowWidth, 0, windowHeight);
+    glMatrixMode(GL_MODELVIEW);
+    glPushMatrix();
+    glLoadIdentity();
+
+    glDisable(GL_LIGHTING);
+    glDisable(GL_DEPTH_TEST);
+
+    // gradient sky -- deeper blue at the zenith, soft light blue at the horizon
+    glBegin(GL_QUADS);
+        glColor3f(0.63f, 0.82f, 0.95f);
+        glVertex2f(0.0f, 0.0f);
+        glVertex2f((float)windowWidth, 0.0f);
+        glColor3f(0.27f, 0.53f, 0.85f);
+        glVertex2f((float)windowWidth, (float)windowHeight);
+        glVertex2f(0.0f, (float)windowHeight);
+    glEnd();
+
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+    // sun with a soft glow
+    float sunX = windowWidth * 0.83f, sunY = windowHeight * 0.86f;
+    glColor4f(1.0f, 0.96f, 0.78f, 0.30f);
+    drawCircle2D(sunX, sunY, 54.0f);
+    glColor4f(1.0f, 0.97f, 0.82f, 1.0f);
+    drawCircle2D(sunX, sunY, 32.0f);
+
+    // distant rolling hills, two layers for depth
+    float horizonY1 = windowHeight * 0.30f;
+    glColor4f(0.55f, 0.72f, 0.48f, 1.0f);
+    glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(0.0f, 0.0f);
+        for (int i = 0; i <= 40; i++) {
+            float t = (float)i / 40.0f;
+            float x = t * windowWidth;
+            float y = horizonY1 + sinf(t*PI_F*2.2f + 1.0f) * 18.0f + 10.0f;
+            glVertex2f(x, y);
+        }
+        glVertex2f((float)windowWidth, 0.0f);
+    glEnd();
+
+    float horizonY2 = windowHeight * 0.24f;
+    glColor4f(0.42f, 0.60f, 0.38f, 1.0f);
+    glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(0.0f, 0.0f);
+        for (int i = 0; i <= 40; i++) {
+            float t = (float)i / 40.0f;
+            float x = t * windowWidth;
+            float y = horizonY2 + sinf(t*PI_F*3.1f + 3.0f) * 14.0f;
+            glVertex2f(x, y);
+        }
+        glVertex2f((float)windowWidth, 0.0f);
+    glEnd();
+
+    // slowly drifting clouds, looping across the screen
+    float timeSec = glutGet(GLUT_ELAPSED_TIME) / 1000.0f;
+    const int cloudCount = 5;
+    for (int i = 0; i < cloudCount; i++) {
+        float speed  = 6.0f + (i % 3) * 3.0f;
+        float span   = windowWidth + 260.0f;
+        float offset = i * 173.0f;
+        float x = fmodf(timeSec*speed + offset, span) - 130.0f;
+        float y = windowHeight * (0.60f + 0.10f * (i % 3));
+        float scale = 55.0f + 18.0f * (i % 2);
+        drawCloud2D(x, y, scale, 0.9f);
+    }
+
+    glDisable(GL_BLEND);
+    glEnable(GL_DEPTH_TEST);
+    glEnable(GL_LIGHTING);
+
+    glMatrixMode(GL_PROJECTION);
+    glPopMatrix();
+    glMatrixMode(GL_MODELVIEW);
+    glPopMatrix();
+}
+
+// ---------------------------------------------------------------
+//  PLANE CRASH EASTER EGG  -- purely cosmetic, triggered at score 911
+// ---------------------------------------------------------------
+void drawPlane(float cx, float cy, float cz) {
+    // fuselage -- nose points toward -X, the direction of travel
+    drawBox(cx, cy - 0.35f, cz, 3.2f, 0.7f, 0.7f, 0.88f, 0.90f, 0.93f);
+    // wings, crossing the fuselage
+    drawBox(cx + 0.1f, cy - 0.12f, cz, 0.9f, 0.15f, 4.4f, 0.78f, 0.81f, 0.85f);
+    // tail fin (trailing edge)
+    drawBox(cx + 1.3f, cy + 0.05f, cz, 0.5f, 0.65f, 0.15f, 0.75f, 0.15f, 0.15f);
+    // horizontal stabilizer
+    drawBox(cx + 1.35f, cy - 0.02f, cz, 0.4f, 0.1f, 1.4f, 0.78f, 0.81f, 0.85f);
+
+    // cockpit window near the nose
+    glDisable(GL_LIGHTING);
+    glColor3f(0.25f, 0.55f, 0.78f);
+    glBegin(GL_QUADS);
+        glVertex3f(cx-1.5f, cy+0.05f, cz-0.15f);
+        glVertex3f(cx-1.0f, cy+0.05f, cz-0.15f);
+        glVertex3f(cx-1.0f, cy+0.05f, cz+0.15f);
+        glVertex3f(cx-1.5f, cy+0.05f, cz+0.15f);
     glEnd();
     glEnable(GL_LIGHTING);
 }
@@ -518,6 +754,11 @@ void resetGame() {
     lastCollapsePenalty = 0;
 
     wobbleAngleX = wobbleVelX = wobbleAngleZ = wobbleVelZ = 0.0f;
+
+    planeState            = PLANE_NONE;
+    planeEventTriggered    = false;
+    planeCrashPopupActive = false;
+    planeCrashPopupTimer  = 0.0f;
 
     Block base;
     base.x = 0; base.y = 0; base.z = 0;
@@ -709,6 +950,50 @@ void update(int value) {
     camYTarget = std::max(6.0f, (float)(tower.size()) * BLOCK_H);
     camY += (camYTarget - camY) * 0.07f;
 
+    // ---- Plane crash easter egg: cosmetic only, never touches score/tower/state ----
+    if (!planeEventTriggered && score >= PLANE_TRIGGER_SCORE) {
+        planeEventTriggered = true;
+        planeState = PLANE_FLYING;
+        const Block &top = tower.back();
+        planeX = top.x + MOVE_RANGE + 26.0f; // starts off-screen to the right
+        planeY = top.y + top.h + 6.0f;
+        planeZ = top.z + 2.0f;
+    }
+
+    if (planeState == PLANE_FLYING) {
+        const Block &top = tower.back();
+        planeX -= PLANE_SPEED * dt;
+        float targetY = top.y + top.h + 1.0f;
+        planeY += (targetY - planeY) * 0.6f * dt;
+
+        if (planeX <= top.x) {
+            planeState = PLANE_CRASHED;
+            planeCrashPopupActive = true;
+            planeCrashPopupTimer  = PLANE_CRASH_POPUP_DURATION;
+            // cosmetic explosion debris -- reuses the falling-piece renderer,
+            // does not touch score, tower, or game state
+            for (int i = 0; i < 10; i++) {
+                float vx = ((rand() % 200) - 100) / 40.0f;
+                float vz = ((rand() % 200) - 100) / 40.0f;
+                float flick = 0.5f + (rand() % 100) / 200.0f;
+                addFallingPiece(planeX + ((rand()%100)-50)/40.0f,
+                                 planeY + ((rand()%100)-50)/40.0f,
+                                 planeZ + ((rand()%100)-50)/40.0f,
+                                 0.4f, 0.4f, 0.4f,
+                                 1.0f, flick * 0.6f, 0.15f, vx, vz);
+            }
+        }
+    }
+
+    if (planeCrashPopupActive) {
+        planeCrashPopupTimer -= dt;
+        if (planeCrashPopupTimer <= 0.0f) {
+            planeCrashPopupTimer  = 0.0f;
+            planeCrashPopupActive = false;
+            planeState = PLANE_NONE;
+        }
+    }
+
     if (perfectPopupActive) {
         perfectPopupTimer -= dt;
         if (perfectPopupTimer <= 0.0f) {
@@ -741,8 +1026,10 @@ void update(int value) {
 //  DISPLAY
 // ---------------------------------------------------------------
 void display() {
-    glClearColor(0.53f, 0.72f, 0.92f, 1.0f);
+    glClearColor(0.27f, 0.53f, 0.85f, 1.0f);
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    drawSkyBackdrop();
 
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
@@ -805,6 +1092,10 @@ void display() {
         glTranslatef(-fp.x, -fp.y, -fp.z);
         drawBox(fp.x, fp.y, fp.z, fp.w, fp.h, fp.d, fp.r, fp.g, fp.b);
         glPopMatrix();
+    }
+
+    if (planeState == PLANE_FLYING) {
+        drawPlane(planeX, planeY, planeZ);
     }
 
     // ---------------- HUD (2D overlay) ----------------
@@ -936,6 +1227,35 @@ void display() {
         char penBuf[32];
         sprintf(penBuf, "-%d points", lastCollapsePenalty);
         drawText(baseX - 40, baseY - 28, penBuf, GLUT_BITMAP_HELVETICA_18);
+
+        glDisable(GL_BLEND);
+    }
+
+    // ---- "Plane crash!" popup: pure spectacle at score 911, score untouched ----
+    if (planeCrashPopupActive) {
+        float t = planeCrashPopupTimer / PLANE_CRASH_POPUP_DURATION;
+        float floatUp = (1.0f - t) * 55.0f;
+        float alpha   = std::min(1.0f, t * 1.6f);
+        float popScale = (t > 0.8f) ? (1.0f + (t - 0.8f) * 2.5f) : 1.0f;
+
+        float baseX = windowWidth / 2.0f;
+        float baseY = windowHeight / 2.0f + 90.0f + floatUp;
+
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+        glColor4f(1.0f, 0.45f, 0.1f, alpha * 0.25f);
+        for (int ox = -2; ox <= 2; ox += 2)
+            for (int oy = -2; oy <= 2; oy += 2)
+                drawText(baseX - 105 * popScale + ox, baseY + oy, "PLANE CRASH!",
+                          GLUT_BITMAP_TIMES_ROMAN_24);
+
+        glColor4f(1.0f, 0.55f, 0.15f, alpha);
+        drawText(baseX - 105 * popScale, baseY, "PLANE CRASH!", GLUT_BITMAP_TIMES_ROMAN_24);
+
+        glColor4f(1.0f, 0.9f, 0.75f, alpha);
+        drawText(baseX - 90, baseY - 28, "(just for fun -- score unaffected)",
+                  GLUT_BITMAP_HELVETICA_12);
 
         glDisable(GL_BLEND);
     }
